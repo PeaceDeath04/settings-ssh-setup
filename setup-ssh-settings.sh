@@ -21,7 +21,8 @@ set -euo pipefail
 # - удаление старого правила 22/tcp;
 # - проверки sshd -t / sshd -T;
 # - проверка реального listening port;
-# - backup;
+# - backup с ротацией (хранится 10 последних);
+# - резервирование порта при попадании в эфемерный диапазон;
 # - автоматический rollback при ошибке;
 # - ручной rollback через --rollback.
 #
@@ -51,6 +52,9 @@ SOCKET_DROPIN="$SOCKET_DROPIN_DIR/override.conf"
 
 BACKUP_ROOT="/root/ssh-hardening-backups"
 CURRENT_BACKUP="$BACKUP_ROOT/current"
+KEEP_BACKUPS=10
+
+SYSCTL_RESERVE_FILE="/etc/sysctl.d/99-ssh-setup-reserved-port.conf"
 
 AUTHORIZED_KEYS=""
 
@@ -113,6 +117,10 @@ USER_CREATED=0
 SSH_CONFIG_EXISTED=0
 SOCKET_DROPIN_EXISTED=0
 
+CONFIG_WRITTEN=0
+SOCKET_WRITTEN=0
+PORT_RESERVED=0
+
 AUTHORIZED_KEYS_EXISTED=0
 KEY_ADDED=0
 
@@ -161,16 +169,77 @@ require_command() {
 
 
 # ============================================================
-# 6. Безопасное удаление backup
+# 6. Вспомогательные функции
 # ============================================================
 
-remove_backup_file() {
+# Безопасное чтение значения из metadata backup.
+# Файл НЕ исполняется (в отличие от source).
+meta_get() {
 
-    local file="$1"
+    local key="$1"
+    local default="${2:-}"
+    local value=""
 
-    if [[ -f "$file" ]]; then
-        sudo rm -f "$file"
+    if [[ -f "$CURRENT_BACKUP/metadata" ]]; then
+        value="$(
+            sudo sed -n "s/^${key}='\(.*\)'$/\1/p" \
+                "$CURRENT_BACKUP/metadata" 2>/dev/null |
+                head -n 1
+        )"
     fi
+
+    printf '%s' "${value:-$default}"
+}
+
+
+# Резервирование порта, если он попадает
+# в диапазон эфемерных портов (по умолчанию 32768-60999).
+#
+# Без резервирования исходящее соединение может
+# временно занять SSH-порт, и sshd не сможет
+# запуститься после рестарта.
+reserve_port_if_needed() {
+
+    local port="$1"
+    local lo hi current merged
+
+    if [[ ! -r /proc/sys/net/ipv4/ip_local_port_range ]]; then
+        return 0
+    fi
+
+    read -r lo hi < /proc/sys/net/ipv4/ip_local_port_range
+
+    if (( port < lo || port > hi )); then
+        info "Порт $port вне эфемерного диапазона ($lo-$hi)."
+        return 0
+    fi
+
+    warn "Порт $port попадает в эфемерный диапазон ($lo-$hi)."
+
+    current="$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)"
+
+    if [[ ",$current," == *",$port,"* ]]; then
+        info "Порт уже зарезервирован в ip_local_reserved_ports."
+        PORT_RESERVED=1
+        return 0
+    fi
+
+    if [[ -n "$current" ]]; then
+        merged="$current,$port"
+    else
+        merged="$port"
+    fi
+
+    sudo tee "$SYSCTL_RESERVE_FILE" >/dev/null <<EOF
+# Зарезервировано setup-ssh-settings.sh
+net.ipv4.ip_local_reserved_ports = $merged
+EOF
+
+    sudo sysctl -p "$SYSCTL_RESERVE_FILE" >/dev/null
+
+    PORT_RESERVED=1
+
+    ok "Порт $port зарезервирован (net.ipv4.ip_local_reserved_ports)."
 }
 
 
@@ -194,6 +263,18 @@ rollback() {
 
     ROLLBACK_RUNNING=1
 
+    # Если изменения ещё не вносились — откатывать нечего.
+    if [[ "$BACKUP_CREATED" -eq 0 &&
+          "$USER_CREATED" -eq 0 &&
+          "$KEY_ADDED" -eq 0 &&
+          "$CONFIG_WRITTEN" -eq 0 &&
+          "$SOCKET_WRITTEN" -eq 0 ]]; then
+
+        echo ""
+        info "Изменения не вносились — откат не требуется."
+        exit "$exit_code"
+    fi
+
     echo ""
     echo "========================================="
     echo "ROLLBACK"
@@ -207,7 +288,7 @@ rollback() {
     # SSH CONFIG
     # --------------------------------------------------------
 
-    if [[ "$BACKUP_CREATED" -eq 1 ]]; then
+    if [[ "$CONFIG_WRITTEN" -eq 1 ]]; then
 
         if [[ "$SSH_CONFIG_EXISTED" -eq 1 ]]; then
 
@@ -236,7 +317,7 @@ rollback() {
     # SSH SOCKET
     # --------------------------------------------------------
 
-    if [[ "$BACKUP_CREATED" -eq 1 ]]; then
+    if [[ "$SOCKET_WRITTEN" -eq 1 ]]; then
 
         if [[ "$SOCKET_DROPIN_EXISTED" -eq 1 ]]; then
 
@@ -302,7 +383,7 @@ rollback() {
         # если его добавил наш скрипт.
         if [[ "$UFW_NEW_PORT_ADDED" -eq 1 ]]; then
 
-            sudo ufw delete allow "$SSH_PORT/tcp" \
+            sudo ufw --force delete allow "$SSH_PORT/tcp" \
                 >/dev/null 2>&1 || true
 
             ok "Удалено правило UFW $SSH_PORT/tcp."
@@ -315,7 +396,7 @@ rollback() {
         if [[ "$UFW_22_EXISTED" -eq 1 ]]; then
 
             if ! sudo ufw status |
-                grep -qE '^22/tcp[[:space:]]+ALLOW'; then
+                grep -qE '^22/tcp[[:space:]]+ALLOW[[:space:]]+Anywhere'; then
 
                 sudo ufw allow 22/tcp \
                     >/dev/null 2>&1 || true
@@ -359,23 +440,26 @@ rollback() {
     # systemd
     # --------------------------------------------------------
 
-    sudo systemctl daemon-reload >/dev/null 2>&1 || true
+    # Перезапускаем только если конфигурация менялась
+    # и только тот механизм, который реально активен.
 
+    if [[ "$CONFIG_WRITTEN" -eq 1 || "$SOCKET_WRITTEN" -eq 1 ]]; then
 
-    # --------------------------------------------------------
-    # Перезапуск SSH
-    # --------------------------------------------------------
+        sudo systemctl daemon-reload >/dev/null 2>&1 || true
 
-    if systemctl list-unit-files |
-        grep -q '^ssh.socket'; then
+        if systemctl is-active --quiet ssh.socket; then
 
-        sudo systemctl restart ssh.socket \
-            >/dev/null 2>&1 || true
+            sudo systemctl restart ssh.socket \
+                >/dev/null 2>&1 || true
+
+        else
+
+            sudo systemctl restart "$SSH_SERVICE" \
+                >/dev/null 2>&1 || true
+
+        fi
 
     fi
-
-    sudo systemctl restart "$SSH_SERVICE" \
-        >/dev/null 2>&1 || true
 
 
     echo ""
@@ -397,6 +481,12 @@ manual_rollback() {
 
     section "ROLLBACK"
 
+    if [[ "$EUID" -ne 0 ]]; then
+
+        die "Запустите rollback через sudo: sudo $SCRIPT_NAME --rollback"
+
+    fi
+
     if [[ ! -d "$CURRENT_BACKUP" ]]; then
 
         die "Backup не найден: $CURRENT_BACKUP"
@@ -416,15 +506,26 @@ manual_rollback() {
 
 
     # --------------------------------------------------------
+    # Читаем metadata backup (без source)
+    # --------------------------------------------------------
+
+    RB_SSH_CONFIG_EXISTED="$(meta_get BACKUP_SSH_CONFIG_EXISTED 0)"
+    RB_SOCKET_EXISTED="$(meta_get BACKUP_SOCKET_EXISTED 0)"
+    RB_UFW_ACTIVE="$(meta_get BACKUP_UFW_ACTIVE 0)"
+    RB_UFW_22_EXISTED="$(meta_get BACKUP_UFW_22_EXISTED 0)"
+    RB_UFW_NEW_PORT_ADDED="$(meta_get BACKUP_UFW_NEW_PORT_ADDED 0)"
+    RB_AK_EXISTED="$(meta_get BACKUP_AUTHORIZED_KEYS_EXISTED 0)"
+    RB_AK_PATH="$(meta_get BACKUP_AUTHORIZED_KEYS_PATH "")"
+    RB_USER_CREATED="$(meta_get BACKUP_USER_CREATED 0)"
+    RB_SSH_USER="$(meta_get BACKUP_SSH_USER "")"
+    RB_SSH_PORT="$(meta_get BACKUP_SSH_PORT "")"
+
+
+    # --------------------------------------------------------
     # Восстанавливаем SSH config
     # --------------------------------------------------------
 
-    if [[ -f "$CURRENT_BACKUP/metadata" ]]; then
-        source "$CURRENT_BACKUP/metadata"
-    fi
-
-
-    if [[ "${BACKUP_SSH_CONFIG_EXISTED:-0}" -eq 1 ]]; then
+    if [[ "$RB_SSH_CONFIG_EXISTED" -eq 1 ]]; then
 
         if [[ -f "$CURRENT_BACKUP/sshd_config" ]]; then
 
@@ -449,7 +550,7 @@ manual_rollback() {
     # ssh.socket
     # --------------------------------------------------------
 
-    if [[ "${BACKUP_SOCKET_EXISTED:-0}" -eq 1 ]]; then
+    if [[ "$RB_SOCKET_EXISTED" -eq 1 ]]; then
 
         if [[ -f "$CURRENT_BACKUP/socket-override" ]]; then
 
@@ -476,22 +577,30 @@ manual_rollback() {
     # UFW
     # --------------------------------------------------------
 
-    if [[ "${BACKUP_UFW_ACTIVE:-0}" -eq 1 ]]; then
+    if [[ "$RB_UFW_ACTIVE" -eq 1 ]]; then
 
-        if [[ "${BACKUP_UFW_NEW_PORT_ADDED:-0}" -eq 1 ]]; then
+        if [[ "$RB_UFW_NEW_PORT_ADDED" -eq 1 ]]; then
 
-            sudo ufw delete allow "$SSH_PORT/tcp" \
-                >/dev/null 2>&1 || true
+            if [[ -n "$RB_SSH_PORT" ]]; then
 
-            ok "Правило $SSH_PORT/tcp удалено."
+                sudo ufw --force delete allow "$RB_SSH_PORT/tcp" \
+                    >/dev/null 2>&1 || true
+
+                ok "Правило $RB_SSH_PORT/tcp удалено."
+
+            else
+
+                warn "Порт из backup не определён — правило UFW не удалено."
+
+            fi
 
         fi
 
 
-        if [[ "${BACKUP_UFW_22_EXISTED:-0}" -eq 1 ]]; then
+        if [[ "$RB_UFW_22_EXISTED" -eq 1 ]]; then
 
             if ! sudo ufw status |
-                grep -qE '^22/tcp[[:space:]]+ALLOW'; then
+                grep -qE '^22/tcp[[:space:]]+ALLOW[[:space:]]+Anywhere'; then
 
                 sudo ufw allow 22/tcp \
                     >/dev/null 2>&1 || true
@@ -509,19 +618,53 @@ manual_rollback() {
     # authorized_keys
     # --------------------------------------------------------
 
-    if [[ "${BACKUP_AUTHORIZED_KEYS_EXISTED:-0}" -eq 1 ]]; then
+    if [[ "$RB_AK_EXISTED" -eq 1 ]]; then
 
-        if [[ -f "$CURRENT_BACKUP/authorized_keys" ]]; then
+        if [[ -f "$CURRENT_BACKUP/authorized_keys" && -n "$RB_AK_PATH" ]]; then
 
-            if [[ -n "${BACKUP_AUTHORIZED_KEYS_PATH:-}" ]]; then
+            sudo mkdir -p "$(dirname "$RB_AK_PATH")"
 
-                sudo mkdir -p "$(dirname "$BACKUP_AUTHORIZED_KEYS_PATH")"
+            sudo cp -a \
+                "$CURRENT_BACKUP/authorized_keys" \
+                "$RB_AK_PATH"
 
-                sudo cp -a \
-                    "$CURRENT_BACKUP/authorized_keys" \
-                    "$BACKUP_AUTHORIZED_KEYS_PATH"
+            ok "authorized_keys восстановлен."
 
-                ok "authorized_keys восстановлен."
+        fi
+
+    elif [[ -n "$RB_AK_PATH" ]]; then
+
+        # Файл был создан скриптом — удаляем его.
+        sudo rm -f "$RB_AK_PATH"
+
+        ok "Созданный скриптом authorized_keys удалён."
+
+    fi
+
+
+    # --------------------------------------------------------
+    # Пользователь, созданный скриптом
+    # --------------------------------------------------------
+
+    if [[ "$RB_USER_CREATED" -eq 1 && -n "$RB_SSH_USER" ]]; then
+
+        if id "$RB_SSH_USER" >/dev/null 2>&1; then
+
+            echo ""
+            read -rp \
+                "Удалить пользователя $RB_SSH_USER, созданного скриптом (вместе с home)? [y/N]: " \
+                CONFIRM_USER
+
+            if [[ "$CONFIRM_USER" =~ ^[Yy]$ ]]; then
+
+                sudo userdel -r "$RB_SSH_USER" \
+                    >/dev/null 2>&1 || true
+
+                ok "Пользователь $RB_SSH_USER удалён."
+
+            else
+
+                info "Пользователь $RB_SSH_USER оставлен."
 
             fi
 
@@ -537,16 +680,17 @@ manual_rollback() {
     sudo systemctl daemon-reload
 
 
-    if systemctl list-unit-files |
-        grep -q '^ssh.socket'; then
+    if systemctl is-active --quiet ssh.socket; then
 
         sudo systemctl restart ssh.socket \
             >/dev/null 2>&1 || true
 
-    fi
+    else
 
-    sudo systemctl restart "$SSH_SERVICE" \
-        >/dev/null 2>&1 || true
+        sudo systemctl restart "$SSH_SERVICE" \
+            >/dev/null 2>&1 || true
+
+    fi
 
 
     echo ""
@@ -609,7 +753,7 @@ ok "Необходимые команды найдены."
 # 13. Текущий пользователь
 # ============================================================
 
-CURRENT_USER="$(id -un)"
+CURRENT_USER="${SUDO_USER:-$(id -un)}"
 
 info "Текущий пользователь: $CURRENT_USER"
 
@@ -666,21 +810,22 @@ fi
 if [[ -z "$SSH_PORT" ]]; then
 
     read -rp \
-        "SSH-порт [Enter = случайный 20000-60000]: " \
+        "SSH-порт [Enter = случайный 20000-32767]: " \
         SSH_PORT
 
 fi
 
 if [[ -z "$SSH_PORT" ]]; then
 
-    SSH_PORT="$(shuf -i 20000-60000 -n 1)"
+    # Вне стандартного диапазона эфемерных портов (32768-60999).
+    SSH_PORT="$(shuf -i 20000-32767 -n 1)"
 
     info "Случайно выбран порт: $SSH_PORT"
 
 fi
 
-if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]]; then
-    die "SSH-порт должен быть числом."
+if ! [[ "$SSH_PORT" =~ ^[1-9][0-9]*$ ]]; then
+    die "SSH-порт должен быть числом без ведущих нулей."
 fi
 
 if (( SSH_PORT < 20000 || SSH_PORT > 60000 )); then
@@ -710,6 +855,18 @@ fi
 # ============================================================
 
 section "Проверка SSH-ключа"
+
+# Защита от вставки приватного ключа:
+# ssh-keygen -lf принимает и приватные ключи тоже.
+KEY_TYPE="${PUBLIC_KEY%% *}"
+
+case "$KEY_TYPE" in
+    ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) ;;
+    *)
+        die "Ключ не похож на публичный (тип: '$KEY_TYPE'). Ожидается ssh-ed25519, ssh-rsa, ecdsa-sha2-* или sk-*. Приватный ключ вводить нельзя."
+        ;;
+esac
+
 
 KEY_FINGERPRINT="$(
     printf '%s\n' "$PUBLIC_KEY" |
@@ -801,6 +958,8 @@ NEW_BACKUP="$BACKUP_ROOT/$TIMESTAMP"
 
 sudo mkdir -p "$NEW_BACKUP"
 
+sudo chmod 700 "$BACKUP_ROOT" "$NEW_BACKUP"
+
 # Удаляем старую ссылку current
 sudo rm -f "$CURRENT_BACKUP"
 
@@ -810,11 +969,25 @@ BACKUP_CREATED=1
 
 
 # ------------------------------------------------------------
+# Ротация backup: храним KEEP_BACKUPS последних
+# ------------------------------------------------------------
+
+sudo find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d |
+    sort |
+    head -n "-$KEEP_BACKUPS" |
+    while IFS= read -r OLD_BACKUP_DIR; do
+        sudo rm -rf "$OLD_BACKUP_DIR"
+    done
+
+
+# ------------------------------------------------------------
 # Backup metadata
 # ------------------------------------------------------------
 
 {
     echo "BACKUP_CREATED_AT='$TIMESTAMP'"
+    echo "BACKUP_SSH_PORT='$SSH_PORT'"
+    echo "BACKUP_SSH_USER='$SSH_USER'"
     echo "BACKUP_SSH_CONFIG_EXISTED='$([[ -f "$SSH_CONFIG" ]] && echo 1 || echo 0)'"
     echo "BACKUP_SOCKET_EXISTED='$([[ -f "$SOCKET_DROPIN" ]] && echo 1 || echo 0)'"
 } | sudo tee "$NEW_BACKUP/metadata" >/dev/null
@@ -856,6 +1029,13 @@ fi
 
 ok "Backup создан:"
 echo "$NEW_BACKUP"
+
+
+# ------------------------------------------------------------
+# Резервирование порта (при необходимости)
+# ------------------------------------------------------------
+
+reserve_port_if_needed "$SSH_PORT"
 
 
 # ============================================================
@@ -918,11 +1098,13 @@ section "SSH-ключ"
 
 AUTHORIZED_KEYS="$USER_HOME/.ssh/authorized_keys"
 
+USER_GROUP="$(id -gn "$SSH_USER")"
+
 sudo install \
     -d \
     -m 700 \
     -o "$SSH_USER" \
-    -g "$SSH_USER" \
+    -g "$USER_GROUP" \
     "$USER_HOME/.ssh"
 
 
@@ -988,8 +1170,9 @@ sudo chmod 600 \
     "$AUTHORIZED_KEYS"
 
 
-# Сохраняем путь для ручного rollback
+# Сохраняем состояние для ручного rollback
 sudo tee -a "$NEW_BACKUP/metadata" >/dev/null <<EOF
+BACKUP_USER_CREATED='$USER_CREATED'
 BACKUP_AUTHORIZED_KEYS_EXISTED='$AUTHORIZED_KEYS_EXISTED'
 BACKUP_AUTHORIZED_KEYS_PATH='$AUTHORIZED_KEYS'
 EOF
@@ -1042,6 +1225,8 @@ AllowAgentForwarding no
 AllowTcpForwarding no
 EOF
 
+CONFIG_WRITTEN=1
+
 
 ok "Создан:"
 echo "$SSH_CONFIG"
@@ -1084,6 +1269,23 @@ first_value() {
 }
 
 
+# Возвращает остаток строки после ключа.
+# Нужно для allowusers — там может быть список имён.
+full_value() {
+
+    local key="$1"
+
+    awk -v key="$key" '
+        $1 == key {
+            $1 = ""
+            sub(/^ /, "")
+            print
+            exit
+        }
+    ' <<< "$EFFECTIVE_CONFIG"
+}
+
+
 count_value() {
 
     local key="$1"
@@ -1105,7 +1307,7 @@ EFFECTIVE_ROOT="$(first_value permitrootlogin)"
 EFFECTIVE_PASSWORD="$(first_value passwordauthentication)"
 EFFECTIVE_INTERACTIVE="$(first_value kbdinteractiveauthentication)"
 EFFECTIVE_PUBKEY="$(first_value pubkeyauthentication)"
-EFFECTIVE_USER="$(first_value allowusers)"
+EFFECTIVE_USER="$(full_value allowusers)"
 
 
 echo "port                       : $EFFECTIVE_PORT"
@@ -1141,7 +1343,7 @@ if [[ "$EFFECTIVE_PUBKEY" != "yes" ]]; then
 fi
 
 if [[ "$EFFECTIVE_USER" != "$SSH_USER" ]]; then
-    die "AllowUsers настроен неправильно."
+    die "AllowUsers настроен неправильно (эффективное значение: '$EFFECTIVE_USER', ожидалось: '$SSH_USER')."
 fi
 
 
@@ -1187,6 +1389,8 @@ if systemctl cat ssh.socket >/dev/null 2>&1; then
 ListenStream=
 ListenStream=$SSH_PORT
 EOF
+
+    SOCKET_WRITTEN=1
 
 
     ok "Создан:"
@@ -1246,11 +1450,11 @@ if command -v ufw >/dev/null 2>&1 &&
     # --------------------------------------------------------
 
     if sudo ufw status |
-        grep -qE '^22/tcp[[:space:]]+ALLOW'; then
+        grep -qE '^22/tcp[[:space:]]+ALLOW[[:space:]]+Anywhere'; then
 
         UFW_22_EXISTED=1
 
-        info "До изменений UFW разрешал 22/tcp."
+        info "До изменений UFW разрешал 22/tcp (Anywhere)."
 
     else
 
@@ -1266,9 +1470,9 @@ if command -v ufw >/dev/null 2>&1 &&
     # --------------------------------------------------------
 
     if sudo ufw status |
-        grep -qE "^${SSH_PORT}/tcp[[:space:]]+ALLOW"; then
+        grep -qE "^${SSH_PORT}/tcp[[:space:]]+ALLOW[[:space:]]+Anywhere"; then
 
-        ok "Порт $SSH_PORT/tcp уже разрешён."
+        ok "Порт $SSH_PORT/tcp уже разрешён (Anywhere)."
 
     else
 
@@ -1287,13 +1491,13 @@ if command -v ufw >/dev/null 2>&1 &&
 
     if [[ "$UFW_22_EXISTED" -eq 1 ]]; then
 
-        sudo ufw delete allow 22/tcp
+        sudo ufw --force delete allow 22/tcp
 
-        ok "Правило 22/tcp удалено."
+        ok "Правило 22/tcp (Anywhere) удалено."
 
     else
 
-        ok "Правила 22/tcp нет."
+        ok "Правила 22/tcp (Anywhere) нет."
 
     fi
 
@@ -1303,9 +1507,9 @@ if command -v ufw >/dev/null 2>&1 &&
     # --------------------------------------------------------
 
     if sudo ufw status |
-        grep -qE "^${SSH_PORT}/tcp[[:space:]]+ALLOW"; then
+        grep -qE "^${SSH_PORT}/tcp[[:space:]]+ALLOW[[:space:]]+Anywhere"; then
 
-        ok "UFW разрешает $SSH_PORT/tcp."
+        ok "UFW разрешает $SSH_PORT/tcp (Anywhere)."
 
     else
 
@@ -1319,13 +1523,26 @@ if command -v ufw >/dev/null 2>&1 &&
     # --------------------------------------------------------
 
     if sudo ufw status |
+        grep -qE '^22/tcp[[:space:]]+ALLOW[[:space:]]+Anywhere'; then
+
+        die "UFW всё ещё разрешает 22/tcp (Anywhere)."
+
+    fi
+
+    ok "UFW больше не разрешает 22/tcp (Anywhere)."
+
+    # Source-specific правила скрипт не трогает,
+    # но предупреждает о них.
+    if sudo ufw status |
         grep -qE '^22/tcp[[:space:]]+ALLOW'; then
 
-        die "UFW всё ещё разрешает 22/tcp."
+        warn "Остались правила 22/tcp с ограничением по источнику:"
 
-    else
+        sudo ufw status |
+            grep -E '^22/tcp[[:space:]]+ALLOW' |
+            sed 's/^/  /'
 
-        ok "UFW больше не разрешает 22/tcp."
+        warn "Удалите их вручную, если они не нужны."
 
     fi
 
@@ -1342,6 +1559,7 @@ sudo tee -a "$NEW_BACKUP/metadata" >/dev/null <<EOF
 BACKUP_UFW_ACTIVE='$UFW_ACTIVE'
 BACKUP_UFW_22_EXISTED='$UFW_22_EXISTED'
 BACKUP_UFW_NEW_PORT_ADDED='$UFW_NEW_PORT_ADDED'
+BACKUP_PORT_RESERVED='$PORT_RESERVED'
 EOF
 
 
@@ -1681,8 +1899,8 @@ FINAL_PUBKEY="$(
 )"
 
 FINAL_USER="$(
-    awk '$1=="allowusers"{print $2; exit}' <<< "$FINAL_CONFIG"
-)
+    awk '$1=="allowusers"{ $1=""; sub(/^ /,""); print; exit }' <<< "$FINAL_CONFIG"
+)"
 
 
 if [[ "$FINAL_PORT" != "$SSH_PORT" ]]; then
@@ -1706,7 +1924,7 @@ if [[ "$FINAL_PUBKEY" != "yes" ]]; then
 fi
 
 if [[ "$FINAL_USER" != "$SSH_USER" ]]; then
-    die "Финальная проверка: AllowUsers настроен неправильно."
+    die "Финальная проверка: AllowUsers настроен неправильно (эффективное значение: '$FINAL_USER')."
 fi
 
 
@@ -1724,6 +1942,9 @@ section "SSH SETUP COMPLETED"
 echo ""
 echo "SSH USER       : $SSH_USER"
 echo "SSH PORT       : $SSH_PORT"
+if (( PORT_RESERVED )); then
+    echo "PORT RESERVED  : $SYSCTL_RESERVE_FILE"
+fi
 echo "ROOT LOGIN     : disabled"
 echo "PASSWORD LOGIN : disabled"
 echo "KEY LOGIN      : enabled"
