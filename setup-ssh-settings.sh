@@ -921,7 +921,7 @@ BUSY_PORT="$(
 
                 if (address ~ /^\[/) {
                     gsub(/^\[/, "", address)
-                    split(address, parts, "\]:")
+                    split(address, parts, /\]:/)
                     current_port=parts[2]
                 } else {
                     n=split(address, parts, ":")
@@ -1286,6 +1286,33 @@ full_value() {
 }
 
 
+# Показывает, откуда sshd берёт Port,
+# если эффективный порт не совпал с ожидаемым.
+show_port_sources() {
+
+    echo ""
+    warn "Ищу все директивы Port в конфигурации sshd:"
+
+    sudo grep -HniE '^[[:space:]]*Port[[:space:]]+[0-9]+' \
+        /etc/ssh/sshd_config \
+        /etc/ssh/sshd_config.d/*.conf \
+        2>/dev/null | sed 's/^/  /' || true
+
+    echo ""
+    warn "Строка Include в /etc/ssh/sshd_config:"
+
+    sudo grep -HniE '^[[:space:]]*Include' \
+        /etc/ssh/sshd_config 2>/dev/null | sed 's/^/  /' || true
+
+    echo ""
+    info "sshd использует ПЕРВОЕ полученное значение Port."
+    info "Строки /etc/ssh/sshd_config ДО строки Include важнее всех drop-in."
+    info "Drop-in файлы читаются в лексикографическом порядке"
+    info "(01-my-settings-ssh.conf раньше, чем 50-cloud-init.conf)."
+    info "Удалите конфликтующую директиву Port и запустите скрипт снова."
+}
+
+
 count_value() {
 
     local key="$1"
@@ -1323,6 +1350,7 @@ echo "allowusers                 : $EFFECTIVE_USER"
 # ------------------------------------------------------------
 
 if [[ "$EFFECTIVE_PORT" != "$SSH_PORT" ]]; then
+    show_port_sources
     die "sshd использует порт $EFFECTIVE_PORT вместо $SSH_PORT."
 fi
 
@@ -1649,7 +1677,7 @@ if ! sudo ss -lHnt |
 
             if (address ~ /^\[/) {
                 gsub(/^\[/, "", address)
-                split(address, parts, "\]:")
+                split(address, parts, /\]:/)
                 current_port=parts[2]
             } else {
                 n=split(address, parts, ":")
@@ -1710,7 +1738,7 @@ if sudo ss -lHnt |
 
             if (address ~ /^\[/) {
                 gsub(/^\[/, "", address)
-                split(address, parts, "\]:")
+                split(address, parts, /\]:/)
                 current_port=parts[2]
             } else {
                 n=split(address, parts, ":")
@@ -1904,7 +1932,8 @@ FINAL_USER="$(
 
 
 if [[ "$FINAL_PORT" != "$SSH_PORT" ]]; then
-    die "Финальная проверка: неправильный SSH-порт."
+    show_port_sources
+    die "Финальная проверка: неправильный SSH-порт (эффективный: $FINAL_PORT)."
 fi
 
 if [[ "$FINAL_ROOT" != "no" ]]; then
