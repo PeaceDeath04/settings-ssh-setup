@@ -1,227 +1,1018 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -e
-
-# ============================================================
-# SSH HARDENING
-# ============================================================
-
-clear
-
-echo "========================================="
-echo "          SSH HARDENING SETUP"
-echo "========================================="
-echo ""
+set -euo pipefail
 
 # ============================================================
-# 1. Ввод всех параметров
+# SSH HARDENING SETUP
+#
+# Базовое усиление безопасности SSH на Ubuntu Server.
+#
+# Возможности:
+# - создание SSH-пользователя;
+# - добавление пользователя в sudo;
+# - установка публичного SSH-ключа;
+# - отключение root login;
+# - отключение password authentication;
+# - отключение keyboard-interactive;
+# - AllowUsers;
+# - изменение SSH-порта;
+# - настройка systemd ssh.socket;
+# - настройка UFW;
+# - удаление старого правила 22/tcp;
+# - проверки sshd -t / sshd -T;
+# - проверка реального listening port;
+# - backup;
+# - автоматический rollback при ошибке;
+# - ручной rollback через --rollback.
+#
+# ВАЖНО:
+# Не закрывайте текущую SSH-сессию, пока не проверите
+# новое подключение.
 # ============================================================
-
-read -rp "Имя главного SSH-пользователя: " SSH_USER
-
-if [[ -z "$SSH_USER" ]]; then
-    echo "[ERROR] Имя пользователя не может быть пустым."
-    exit 1
-fi
-
-# Имя пользователя — только стандартный Linux-вариант
-if ! [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
-    echo "[ERROR] Некорректное имя пользователя."
-    exit 1
-fi
-
-
-echo ""
-
-read -rp "SSH-порт [Enter = случайный 20000-60000]: " SSH_PORT
-
-if [[ -z "$SSH_PORT" ]]; then
-    SSH_PORT=$(shuf -i 20000-60000 -n 1)
-fi
-
-if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]]; then
-    echo "[ERROR] SSH-порт должен быть числом."
-    exit 1
-fi
-
-if (( SSH_PORT < 20000 || SSH_PORT > 60000 )); then
-    echo "[ERROR] SSH-порт должен быть от 20000 до 60000."
-    exit 1
-fi
-
-
-echo ""
-
-read -rp "Ваш публичный SSH-ключ: " PUBLIC_KEY
-
-if [[ -z "$PUBLIC_KEY" ]]; then
-    echo "[ERROR] Публичный ключ не может быть пустым."
-    exit 1
-fi
 
 
 # ============================================================
-# 2. Показываем выбранные настройки
+# 0. PATH
 # ============================================================
 
-echo ""
-echo "========================================="
-echo "          ВЫБРАННЫЕ НАСТРОЙКИ"
-echo "========================================="
-echo ""
-echo "SSH USER : $SSH_USER"
-echo "SSH PORT : $SSH_PORT"
-echo "SSH KEY  : ${PUBLIC_KEY:0:40}..."
-echo ""
-echo "Главный конфиг:"
-echo "/etc/ssh/sshd_config.d/01-my-settings-ssh.conf"
-echo ""
-echo "SSH socket override:"
-echo "/etc/systemd/system/ssh.socket.d/override.conf"
-echo ""
-
-read -rp "Продолжить? [y/N]: " CONFIRM
-
-if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-    echo "Отменено."
-    exit 0
-fi
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 
 # ============================================================
-# 3. Проверяем наличие sshd
+# 1. Константы
 # ============================================================
 
-echo ""
-echo "========================================="
-echo "3. Проверка SSH"
-echo "========================================="
-
-if ! command -v sshd >/dev/null 2>&1; then
-    echo "[ERROR] sshd не найден."
-    exit 1
-fi
-
-echo "[OK] sshd найден."
-
-
-# ============================================================
-# 4. Проверяем текущие SSH-конфиги
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "4. Текущие SSH-конфиги"
-echo "========================================="
-
-echo ""
-echo "--- /etc/ssh/sshd_config ---"
-
-if [[ -f /etc/ssh/sshd_config ]]; then
-    sudo sed -n '1,240p' /etc/ssh/sshd_config
-else
-    echo "[WARNING] Файл отсутствует."
-fi
-
-echo ""
-echo "--- /etc/ssh/sshd_config.d/ ---"
-
-sudo find /etc/ssh/sshd_config.d \
-    -maxdepth 1 \
-    -type f \
-    -printf '%f\n' \
-    2>/dev/null | sort || true
-
-
-# ============================================================
-# 5. Проверяем выбранный порт
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "5. Проверка порта $SSH_PORT"
-echo "========================================="
-
-if sudo ss -lntup | grep -qE ":${SSH_PORT}\b"; then
-
-    echo "[ERROR] Порт $SSH_PORT уже используется:"
-    sudo ss -lntup | grep -E ":${SSH_PORT}\b"
-
-    exit 1
-
-else
-
-    echo "[OK] Порт $SSH_PORT свободен."
-
-fi
-
-
-# ============================================================
-# 6. Создаём пользователя
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "6. Пользователь $SSH_USER"
-echo "========================================="
-
-if id "$SSH_USER" >/dev/null 2>&1; then
-
-    echo "[INFO] Пользователь уже существует."
-
-else
-
-    sudo adduser --disabled-password --gecos "" "$SSH_USER"
-
-    echo "[OK] Пользователь создан."
-
-fi
-
-sudo usermod -aG sudo "$SSH_USER"
-
-echo "[OK] Пользователь добавлен в группу sudo."
-
-
-# ============================================================
-# 7. Настраиваем SSH-ключ
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "7. Установка SSH-ключа"
-echo "========================================="
-
-sudo mkdir -p "/home/$SSH_USER/.ssh"
-
-echo "$PUBLIC_KEY" | sudo tee \
-    "/home/$SSH_USER/.ssh/authorized_keys" > /dev/null
-
-sudo chown -R "$SSH_USER:$SSH_USER" \
-    "/home/$SSH_USER/.ssh"
-
-sudo chmod 700 \
-    "/home/$SSH_USER/.ssh"
-
-sudo chmod 600 \
-    "/home/$SSH_USER/.ssh/authorized_keys"
-
-echo "[OK] SSH-ключ установлен."
-
-
-# ============================================================
-# 8. Создаём главный SSH-конфиг
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "8. Главный SSH-конфиг"
-echo "========================================="
+SCRIPT_NAME="$(basename "$0")"
 
 SSH_CONFIG="/etc/ssh/sshd_config.d/01-my-settings-ssh.conf"
 
-sudo tee "$SSH_CONFIG" > /dev/null <<EOF
+SOCKET_DROPIN_DIR="/etc/systemd/system/ssh.socket.d"
+SOCKET_DROPIN="$SOCKET_DROPIN_DIR/override.conf"
+
+BACKUP_ROOT="/root/ssh-hardening-backups"
+CURRENT_BACKUP="$BACKUP_ROOT/current"
+
+AUTHORIZED_KEYS=""
+
+SSH_SERVICE="ssh"
+
+if ! systemctl cat ssh.service >/dev/null 2>&1; then
+    SSH_SERVICE="sshd"
+fi
+
+
 # ============================================================
-# My SSH settings
+# 2. Цвета и функции вывода
+# ============================================================
+
+C_RED=$'\033[31m'
+C_GREEN=$'\033[32m'
+C_YELLOW=$'\033[33m'
+C_BLUE=$'\033[34m'
+C_RESET=$'\033[0m'
+
+ok() {
+    printf '%s[OK]%s %s\n' "$C_GREEN" "$C_RESET" "$*"
+}
+
+info() {
+    printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_RESET" "$*"
+}
+
+warn() {
+    printf '%s[WARNING]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"
+}
+
+error() {
+    printf '%s[ERROR]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+}
+
+die() {
+    error "$*"
+    exit 1
+}
+
+section() {
+    echo ""
+    echo "========================================="
+    echo "$*"
+    echo "========================================="
+}
+
+
+# ============================================================
+# 3. Переменные состояния
+# ============================================================
+
+SSH_USER="${SSH_USER:-}"
+SSH_PORT="${SSH_PORT:-}"
+PUBLIC_KEY="${PUBLIC_KEY:-}"
+
+USER_CREATED=0
+
+SSH_CONFIG_EXISTED=0
+SOCKET_DROPIN_EXISTED=0
+
+AUTHORIZED_KEYS_EXISTED=0
+KEY_ADDED=0
+
+UFW_ACTIVE=0
+UFW_22_EXISTED=0
+UFW_NEW_PORT_ADDED=0
+
+BACKUP_CREATED=0
+ROLLBACK_RUNNING=0
+
+OLD_SSH_CONFIG_BACKUP=""
+OLD_SOCKET_BACKUP=""
+OLD_AUTHORIZED_KEYS_BACKUP=""
+
+CURRENT_USER=""
+
+
+# ============================================================
+# 4. Проверка sudo
+# ============================================================
+
+require_sudo() {
+
+    if [[ "$EUID" -eq 0 ]]; then
+        return 0
+    fi
+
+    if ! sudo -v >/dev/null 2>&1; then
+        die "Необходимы права sudo."
+    fi
+}
+
+
+# ============================================================
+# 5. Проверка команды
+# ============================================================
+
+require_command() {
+
+    local command_name="$1"
+
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        die "Не найдена команда: $command_name"
+    fi
+}
+
+
+# ============================================================
+# 6. Безопасное удаление backup
+# ============================================================
+
+remove_backup_file() {
+
+    local file="$1"
+
+    if [[ -f "$file" ]]; then
+        sudo rm -f "$file"
+    fi
+}
+
+
+# ============================================================
+# 7. Rollback
+# ============================================================
+
+rollback() {
+
+    local exit_code=$?
+
+    # Если всё завершилось успешно — rollback не нужен.
+    if [[ "$exit_code" -eq 0 ]]; then
+        return 0
+    fi
+
+    # Защита от повторного запуска rollback.
+    if [[ "$ROLLBACK_RUNNING" -eq 1 ]]; then
+        return 0
+    fi
+
+    ROLLBACK_RUNNING=1
+
+    echo ""
+    echo "========================================="
+    echo "ROLLBACK"
+    echo "========================================="
+    echo ""
+
+    error "Скрипт завершился с ошибкой."
+    info "Попытка откатить изменения..."
+
+    # --------------------------------------------------------
+    # SSH CONFIG
+    # --------------------------------------------------------
+
+    if [[ "$BACKUP_CREATED" -eq 1 ]]; then
+
+        if [[ "$SSH_CONFIG_EXISTED" -eq 1 ]]; then
+
+            if [[ -f "$OLD_SSH_CONFIG_BACKUP" ]]; then
+
+                sudo cp -a \
+                    "$OLD_SSH_CONFIG_BACKUP" \
+                    "$SSH_CONFIG"
+
+                ok "Восстановлен старый SSH-конфиг."
+
+            fi
+
+        else
+
+            sudo rm -f "$SSH_CONFIG"
+
+            ok "Удалён созданный SSH-конфиг."
+
+        fi
+
+    fi
+
+
+    # --------------------------------------------------------
+    # SSH SOCKET
+    # --------------------------------------------------------
+
+    if [[ "$BACKUP_CREATED" -eq 1 ]]; then
+
+        if [[ "$SOCKET_DROPIN_EXISTED" -eq 1 ]]; then
+
+            if [[ -f "$OLD_SOCKET_BACKUP" ]]; then
+
+                sudo mkdir -p "$SOCKET_DROPIN_DIR"
+
+                sudo cp -a \
+                    "$OLD_SOCKET_BACKUP" \
+                    "$SOCKET_DROPIN"
+
+                ok "Восстановлен старый ssh.socket override."
+
+            fi
+
+        else
+
+            sudo rm -f "$SOCKET_DROPIN"
+
+            ok "Удалён созданный ssh.socket override."
+
+        fi
+
+    fi
+
+
+    # --------------------------------------------------------
+    # authorized_keys
+    # --------------------------------------------------------
+
+    if [[ "$KEY_ADDED" -eq 1 ]]; then
+
+        if [[ "$AUTHORIZED_KEYS_EXISTED" -eq 1 ]]; then
+
+            if [[ -f "$OLD_AUTHORIZED_KEYS_BACKUP" ]]; then
+
+                sudo cp -a \
+                    "$OLD_AUTHORIZED_KEYS_BACKUP" \
+                    "$AUTHORIZED_KEYS"
+
+                ok "Восстановлен старый authorized_keys."
+
+            fi
+
+        else
+
+            sudo rm -f "$AUTHORIZED_KEYS"
+
+            ok "Удалён созданный authorized_keys."
+
+        fi
+
+    fi
+
+
+    # --------------------------------------------------------
+    # UFW
+    # --------------------------------------------------------
+
+    if [[ "$UFW_ACTIVE" -eq 1 ]]; then
+
+        # Удаляем только правило нового порта,
+        # если его добавил наш скрипт.
+        if [[ "$UFW_NEW_PORT_ADDED" -eq 1 ]]; then
+
+            sudo ufw delete allow "$SSH_PORT/tcp" \
+                >/dev/null 2>&1 || true
+
+            ok "Удалено правило UFW $SSH_PORT/tcp."
+
+        fi
+
+
+        # Восстанавливаем 22 только если оно существовало
+        # до запуска скрипта.
+        if [[ "$UFW_22_EXISTED" -eq 1 ]]; then
+
+            if ! sudo ufw status |
+                grep -qE '^22/tcp[[:space:]]+ALLOW'; then
+
+                sudo ufw allow 22/tcp \
+                    >/dev/null 2>&1 || true
+
+                ok "Восстановлено правило UFW 22/tcp."
+
+            fi
+
+        fi
+
+    fi
+
+
+    # --------------------------------------------------------
+    # Пользователь
+    # --------------------------------------------------------
+
+    # ВАЖНО:
+    #
+    # Если пользователь был создан этим скриптом,
+    # удаляем его только при rollback.
+    #
+    # Существующего пользователя никогда не удаляем.
+    #
+
+    if [[ "$USER_CREATED" -eq 1 ]]; then
+
+        if id "$SSH_USER" >/dev/null 2>&1; then
+
+            sudo userdel -r "$SSH_USER" \
+                >/dev/null 2>&1 || true
+
+            ok "Удалён пользователь, созданный скриптом: $SSH_USER"
+
+        fi
+
+    fi
+
+
+    # --------------------------------------------------------
+    # systemd
+    # --------------------------------------------------------
+
+    sudo systemctl daemon-reload >/dev/null 2>&1 || true
+
+
+    # --------------------------------------------------------
+    # Перезапуск SSH
+    # --------------------------------------------------------
+
+    if systemctl list-unit-files |
+        grep -q '^ssh.socket'; then
+
+        sudo systemctl restart ssh.socket \
+            >/dev/null 2>&1 || true
+
+    fi
+
+    sudo systemctl restart "$SSH_SERVICE" \
+        >/dev/null 2>&1 || true
+
+
+    echo ""
+    info "Rollback завершён."
+    echo ""
+    echo "Backup:"
+    echo "$CURRENT_BACKUP"
+    echo ""
+
+    exit "$exit_code"
+}
+
+
+# ============================================================
+# 8. Ручной rollback
+# ============================================================
+
+manual_rollback() {
+
+    section "ROLLBACK"
+
+    if [[ ! -d "$CURRENT_BACKUP" ]]; then
+
+        die "Backup не найден: $CURRENT_BACKUP"
+
+    fi
+
+    info "Найден backup:"
+    echo "$CURRENT_BACKUP"
+    echo ""
+
+    read -rp "Выполнить rollback? [y/N]: " CONFIRM
+
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        echo "Отменено."
+        exit 0
+    fi
+
+
+    # --------------------------------------------------------
+    # Восстанавливаем SSH config
+    # --------------------------------------------------------
+
+    if [[ -f "$CURRENT_BACKUP/metadata" ]]; then
+        source "$CURRENT_BACKUP/metadata"
+    fi
+
+
+    if [[ "${BACKUP_SSH_CONFIG_EXISTED:-0}" -eq 1 ]]; then
+
+        if [[ -f "$CURRENT_BACKUP/sshd_config" ]]; then
+
+            sudo cp -a \
+                "$CURRENT_BACKUP/sshd_config" \
+                "$SSH_CONFIG"
+
+            ok "SSH-конфиг восстановлен."
+
+        fi
+
+    else
+
+        sudo rm -f "$SSH_CONFIG"
+
+        ok "SSH-конфиг удалён."
+
+    fi
+
+
+    # --------------------------------------------------------
+    # ssh.socket
+    # --------------------------------------------------------
+
+    if [[ "${BACKUP_SOCKET_EXISTED:-0}" -eq 1 ]]; then
+
+        if [[ -f "$CURRENT_BACKUP/socket-override" ]]; then
+
+            sudo mkdir -p "$SOCKET_DROPIN_DIR"
+
+            sudo cp -a \
+                "$CURRENT_BACKUP/socket-override" \
+                "$SOCKET_DROPIN"
+
+            ok "ssh.socket override восстановлен."
+
+        fi
+
+    else
+
+        sudo rm -f "$SOCKET_DROPIN"
+
+        ok "ssh.socket override удалён."
+
+    fi
+
+
+    # --------------------------------------------------------
+    # UFW
+    # --------------------------------------------------------
+
+    if [[ "${BACKUP_UFW_ACTIVE:-0}" -eq 1 ]]; then
+
+        if [[ "${BACKUP_UFW_NEW_PORT_ADDED:-0}" -eq 1 ]]; then
+
+            sudo ufw delete allow "$SSH_PORT/tcp" \
+                >/dev/null 2>&1 || true
+
+            ok "Правило $SSH_PORT/tcp удалено."
+
+        fi
+
+
+        if [[ "${BACKUP_UFW_22_EXISTED:-0}" -eq 1 ]]; then
+
+            if ! sudo ufw status |
+                grep -qE '^22/tcp[[:space:]]+ALLOW'; then
+
+                sudo ufw allow 22/tcp \
+                    >/dev/null 2>&1 || true
+
+                ok "Правило 22/tcp восстановлено."
+
+            fi
+
+        fi
+
+    fi
+
+
+    # --------------------------------------------------------
+    # authorized_keys
+    # --------------------------------------------------------
+
+    if [[ "${BACKUP_AUTHORIZED_KEYS_EXISTED:-0}" -eq 1 ]]; then
+
+        if [[ -f "$CURRENT_BACKUP/authorized_keys" ]]; then
+
+            if [[ -n "${BACKUP_AUTHORIZED_KEYS_PATH:-}" ]]; then
+
+                sudo mkdir -p "$(dirname "$BACKUP_AUTHORIZED_KEYS_PATH")"
+
+                sudo cp -a \
+                    "$CURRENT_BACKUP/authorized_keys" \
+                    "$BACKUP_AUTHORIZED_KEYS_PATH"
+
+                ok "authorized_keys восстановлен."
+
+            fi
+
+        fi
+
+    fi
+
+
+    # --------------------------------------------------------
+    # systemd
+    # --------------------------------------------------------
+
+    sudo systemctl daemon-reload
+
+
+    if systemctl list-unit-files |
+        grep -q '^ssh.socket'; then
+
+        sudo systemctl restart ssh.socket \
+            >/dev/null 2>&1 || true
+
+    fi
+
+    sudo systemctl restart "$SSH_SERVICE" \
+        >/dev/null 2>&1 || true
+
+
+    echo ""
+    ok "Rollback завершён."
+    echo ""
+    echo "Проверьте SSH:"
+    echo "sudo sshd -T | grep -E '^(port|permitrootlogin|passwordauthentication|allowusers) '"
+    echo ""
+
+    exit 0
+}
+
+
+# ============================================================
+# 9. --rollback
+# ============================================================
+
+if [[ "${1:-}" == "--rollback" ]]; then
+
+    require_sudo
+    manual_rollback
+
+fi
+
+
+# ============================================================
+# 10. Trap
+# ============================================================
+
+trap rollback EXIT
+
+
+# ============================================================
+# 11. Проверка sudo
+# ============================================================
+
+require_sudo
+
+
+# ============================================================
+# 12. Проверяем необходимые команды
+# ============================================================
+
+section "Проверка системы"
+
+require_command sshd
+require_command ssh-keygen
+require_command ss
+require_command systemctl
+require_command awk
+require_command grep
+require_command sed
+require_command shuf
+require_command getent
+
+ok "Необходимые команды найдены."
+
+
+# ============================================================
+# 13. Текущий пользователь
+# ============================================================
+
+CURRENT_USER="$(id -un)"
+
+info "Текущий пользователь: $CURRENT_USER"
+
+
+# ============================================================
+# 14. Ввод параметров
+# ============================================================
+
+section "Параметры"
+
+
+# ------------------------------------------------------------
+# SSH USER
+# ------------------------------------------------------------
+
+if [[ -z "$SSH_USER" ]]; then
+
+    read -rp "Имя главного SSH-пользователя: " SSH_USER
+
+fi
+
+if [[ -z "$SSH_USER" ]]; then
+    die "Имя пользователя не может быть пустым."
+fi
+
+if ! [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+    die "Некорректное имя пользователя."
+fi
+
+
+# ------------------------------------------------------------
+# Проверка текущего пользователя
+# ------------------------------------------------------------
+
+if [[ "$CURRENT_USER" != "$SSH_USER" ]]; then
+
+    warn "Текущий пользователь: $CURRENT_USER"
+    warn "После применения AllowUsers будет разрешён только: $SSH_USER"
+    warn "Пользователь $CURRENT_USER больше не сможет входить через SSH."
+
+    read -rp "Продолжить? [y/N]: " CONFIRM
+
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        die "Отменено."
+    fi
+
+fi
+
+
+# ------------------------------------------------------------
+# SSH PORT
+# ------------------------------------------------------------
+
+if [[ -z "$SSH_PORT" ]]; then
+
+    read -rp \
+        "SSH-порт [Enter = случайный 20000-60000]: " \
+        SSH_PORT
+
+fi
+
+if [[ -z "$SSH_PORT" ]]; then
+
+    SSH_PORT="$(shuf -i 20000-60000 -n 1)"
+
+    info "Случайно выбран порт: $SSH_PORT"
+
+fi
+
+if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]]; then
+    die "SSH-порт должен быть числом."
+fi
+
+if (( SSH_PORT < 20000 || SSH_PORT > 60000 )); then
+    die "SSH-порт должен быть от 20000 до 60000."
+fi
+
+
+# ------------------------------------------------------------
+# PUBLIC KEY
+# ------------------------------------------------------------
+
+if [[ -z "$PUBLIC_KEY" ]]; then
+
+    read -rp \
+        "Ваш публичный SSH-ключ: " \
+        PUBLIC_KEY
+
+fi
+
+if [[ -z "$PUBLIC_KEY" ]]; then
+    die "Публичный SSH-ключ не может быть пустым."
+fi
+
+
+# ============================================================
+# 15. Проверка SSH-ключа
+# ============================================================
+
+section "Проверка SSH-ключа"
+
+KEY_FINGERPRINT="$(
+    printf '%s\n' "$PUBLIC_KEY" |
+        ssh-keygen -lf - 2>/dev/null || true
+)"
+
+if [[ -z "$KEY_FINGERPRINT" ]]; then
+
+    die "Указанный ключ не является корректным публичным SSH-ключом."
+
+fi
+
+ok "SSH-ключ распознан:"
+echo "$KEY_FINGERPRINT"
+
+
+# ============================================================
+# 16. Показываем настройки
+# ============================================================
+
+section "Выбранные настройки"
+
+echo "SSH USER : $SSH_USER"
+echo "SSH PORT : $SSH_PORT"
+echo "SSH KEY  : $KEY_FINGERPRINT"
+echo ""
+echo "SSH config:"
+echo "$SSH_CONFIG"
+echo ""
+echo "ssh.socket override:"
+echo "$SOCKET_DROPIN"
+echo ""
+
+read -rp "Применить настройки? [y/N]: " CONFIRM
+
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    die "Отменено."
+fi
+
+
+# ============================================================
+# 17. Проверка свободного порта
+# ============================================================
+
+section "Проверка порта $SSH_PORT"
+
+BUSY_PORT="$(
+    sudo ss -lHnt 2>/dev/null |
+        awk -v port="$SSH_PORT" '
+            {
+                address=$4
+
+                if (address ~ /^\[/) {
+                    gsub(/^\[/, "", address)
+                    split(address, parts, "\]:")
+                    current_port=parts[2]
+                } else {
+                    n=split(address, parts, ":")
+                    current_port=parts[n]
+                }
+
+                if (current_port == port) {
+                    print
+                }
+            }
+        ' || true
+)"
+
+if [[ -n "$BUSY_PORT" ]]; then
+
+    echo "$BUSY_PORT"
+
+    die "Порт $SSH_PORT уже используется."
+
+fi
+
+ok "Порт $SSH_PORT свободен."
+
+
+# ============================================================
+# 18. Создание backup
+# ============================================================
+
+section "Создание backup"
+
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+
+NEW_BACKUP="$BACKUP_ROOT/$TIMESTAMP"
+
+sudo mkdir -p "$NEW_BACKUP"
+
+# Удаляем старую ссылку current
+sudo rm -f "$CURRENT_BACKUP"
+
+sudo ln -s "$NEW_BACKUP" "$CURRENT_BACKUP"
+
+BACKUP_CREATED=1
+
+
+# ------------------------------------------------------------
+# Backup metadata
+# ------------------------------------------------------------
+
+{
+    echo "BACKUP_CREATED_AT='$TIMESTAMP'"
+    echo "BACKUP_SSH_CONFIG_EXISTED='$([[ -f "$SSH_CONFIG" ]] && echo 1 || echo 0)'"
+    echo "BACKUP_SOCKET_EXISTED='$([[ -f "$SOCKET_DROPIN" ]] && echo 1 || echo 0)'"
+} | sudo tee "$NEW_BACKUP/metadata" >/dev/null
+
+
+# ------------------------------------------------------------
+# Backup SSH config
+# ------------------------------------------------------------
+
+if [[ -f "$SSH_CONFIG" ]]; then
+
+    SSH_CONFIG_EXISTED=1
+
+    sudo cp -a \
+        "$SSH_CONFIG" \
+        "$NEW_BACKUP/sshd_config"
+
+    OLD_SSH_CONFIG_BACKUP="$NEW_BACKUP/sshd_config"
+
+fi
+
+
+# ------------------------------------------------------------
+# Backup socket override
+# ------------------------------------------------------------
+
+if [[ -f "$SOCKET_DROPIN" ]]; then
+
+    SOCKET_DROPIN_EXISTED=1
+
+    sudo cp -a \
+        "$SOCKET_DROPIN" \
+        "$NEW_BACKUP/socket-override"
+
+    OLD_SOCKET_BACKUP="$NEW_BACKUP/socket-override"
+
+fi
+
+
+ok "Backup создан:"
+echo "$NEW_BACKUP"
+
+
+# ============================================================
+# 19. Пользователь
+# ============================================================
+
+section "Пользователь $SSH_USER"
+
+if id "$SSH_USER" >/dev/null 2>&1; then
+
+    info "Пользователь уже существует."
+
+else
+
+    sudo adduser \
+        --disabled-password \
+        --gecos "" \
+        "$SSH_USER"
+
+    USER_CREATED=1
+
+    ok "Пользователь создан."
+
+fi
+
+
+# ------------------------------------------------------------
+# Добавляем sudo
+# ------------------------------------------------------------
+
+if getent group sudo >/dev/null 2>&1; then
+
+    sudo usermod -aG sudo "$SSH_USER"
+
+    ok "$SSH_USER добавлен в группу sudo."
+
+else
+
+    warn "Группа sudo не найдена."
+
+fi
+
+
+# ------------------------------------------------------------
+# Определяем HOME
+# ------------------------------------------------------------
+
+USER_HOME="$(getent passwd "$SSH_USER" | cut -d: -f6)"
+
+if [[ -z "$USER_HOME" || ! -d "$USER_HOME" ]]; then
+    die "Не удалось определить домашний каталог пользователя."
+fi
+
+
+# ============================================================
+# 20. authorized_keys
+# ============================================================
+
+section "SSH-ключ"
+
+AUTHORIZED_KEYS="$USER_HOME/.ssh/authorized_keys"
+
+sudo install \
+    -d \
+    -m 700 \
+    -o "$SSH_USER" \
+    -g "$SSH_USER" \
+    "$USER_HOME/.ssh"
+
+
+# ------------------------------------------------------------
+# Сохраняем существующий authorized_keys
+# ------------------------------------------------------------
+
+if [[ -f "$AUTHORIZED_KEYS" ]]; then
+
+    AUTHORIZED_KEYS_EXISTED=1
+
+    OLD_AUTHORIZED_KEYS_BACKUP="$NEW_BACKUP/authorized_keys"
+
+    sudo cp -a \
+        "$AUTHORIZED_KEYS" \
+        "$OLD_AUTHORIZED_KEYS_BACKUP"
+
+fi
+
+
+# ------------------------------------------------------------
+# Проверяем, есть ли уже такой ключ
+# ------------------------------------------------------------
+
+if sudo grep -Fqx "$PUBLIC_KEY" "$AUTHORIZED_KEYS" 2>/dev/null; then
+
+    info "Этот SSH-ключ уже существует."
+
+else
+
+    printf '%s\n' "$PUBLIC_KEY" |
+        sudo tee -a "$AUTHORIZED_KEYS" >/dev/null
+
+    KEY_ADDED=1
+
+    ok "SSH-ключ добавлен."
+
+fi
+
+
+# ------------------------------------------------------------
+# Если файл существовал — сохраняем его состояние
+# ------------------------------------------------------------
+
+if [[ "$AUTHORIZED_KEYS_EXISTED" -eq 0 ]]; then
+
+    # Если файл был создан нами, записываем его backup path.
+    sudo cp -a \
+        "$AUTHORIZED_KEYS" \
+        "$NEW_BACKUP/authorized_keys"
+
+fi
+
+
+sudo chown -R \
+    "$SSH_USER:$SSH_USER" \
+    "$USER_HOME/.ssh"
+
+sudo chmod 700 \
+    "$USER_HOME/.ssh"
+
+sudo chmod 600 \
+    "$AUTHORIZED_KEYS"
+
+
+# Сохраняем путь для ручного rollback
+sudo tee -a "$NEW_BACKUP/metadata" >/dev/null <<EOF
+BACKUP_AUTHORIZED_KEYS_EXISTED='$AUTHORIZED_KEYS_EXISTED'
+BACKUP_AUTHORIZED_KEYS_PATH='$AUTHORIZED_KEYS'
+EOF
+
+
+ok "authorized_keys настроен."
+
+
+# ============================================================
+# 21. SSH config
+# ============================================================
+
+section "SSH-конфигурация"
+
+sudo install \
+    -d \
+    -m 755 \
+    /etc/ssh/sshd_config.d
+
+
+sudo tee "$SSH_CONFIG" >/dev/null <<EOF
+# ============================================================
+# SSH settings managed by setup-ssh-settings.sh
 # ============================================================
 
 Port $SSH_PORT
@@ -235,511 +1026,701 @@ KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 
 AllowUsers $SSH_USER
+
+MaxAuthTries 4
+
+LoginGraceTime 30
+
+ClientAliveInterval 300
+
+ClientAliveCountMax 2
+
+X11Forwarding no
+
+AllowAgentForwarding no
+
+AllowTcpForwarding no
 EOF
 
-echo "[OK] Создан:"
+
+ok "Создан:"
 echo "$SSH_CONFIG"
 
 
 # ============================================================
-# 9. Проверяем синтаксис SSH
+# 22. Проверка sshd -t
 # ============================================================
 
-echo ""
-echo "========================================="
-echo "9. Проверка синтаксиса sshd"
-echo "========================================="
+section "Проверка синтаксиса SSH"
 
-sudo sshd -t
+if ! sudo sshd -t; then
 
-echo "[OK] SSH-конфигурация синтаксически корректна."
+    die "sshd -t обнаружил ошибку."
 
+fi
 
-# ============================================================
-# 10. Показываем порядок конфигов
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "10. Порядок SSH-конфигов"
-echo "========================================="
-
-sudo find /etc/ssh/sshd_config.d \
-    -maxdepth 1 \
-    -type f \
-    -printf '%f\n' \
-    2>/dev/null | sort
+ok "SSH-конфигурация синтаксически корректна."
 
 
 # ============================================================
-# 11. Показываем наш конфиг
+# 23. Эффективный SSH config
 # ============================================================
 
-echo ""
-echo "========================================="
-echo "11. Наш главный конфиг"
-echo "========================================="
+section "Эффективные настройки SSH"
 
-sudo cat "$SSH_CONFIG"
+EFFECTIVE_CONFIG="$(sudo sshd -T)"
 
 
-# ============================================================
-# 12. Проверяем эффективный конфиг
-# ============================================================
+first_value() {
 
-echo ""
-echo "========================================="
-echo "12. Эффективные настройки sshd"
-echo "========================================="
+    local key="$1"
 
-sudo sshd -T | grep -E \
-'^(port|listenaddress|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|allowusers|authorizedkeysfile) '
-
-
-# ============================================================
-# 13. Проверяем эффективные значения
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "13. Проверка параметров"
-echo "========================================="
-
-EFFECTIVE_PORT=$(sudo sshd -T | awk '$1=="port"{print $2; exit}')
-EFFECTIVE_ROOT=$(sudo sshd -T | awk '$1=="permitrootlogin"{print $2}')
-EFFECTIVE_PASSWORD=$(sudo sshd -T | awk '$1=="passwordauthentication"{print $2}')
-EFFECTIVE_INTERACTIVE=$(sudo sshd -T | awk '$1=="kbdinteractiveauthentication"{print $2}')
-EFFECTIVE_PUBKEY=$(sudo sshd -T | awk '$1=="pubkeyauthentication"{print $2}')
-EFFECTIVE_USER=$(sudo sshd -T | awk '$1=="allowusers"{print $2}')
+    awk -v key="$key" '
+        $1 == key {
+            print $2
+            exit
+        }
+    ' <<< "$EFFECTIVE_CONFIG"
+}
 
 
-if [[ "$EFFECTIVE_PORT" == "$SSH_PORT" ]]; then
-    echo "[OK] SSH port: $SSH_PORT"
-else
-    echo "[ERROR] SSH использует порт $EFFECTIVE_PORT вместо $SSH_PORT."
-    exit 1
+count_value() {
+
+    local key="$1"
+
+    awk -v key="$key" '
+        $1 == key {
+            count++
+        }
+
+        END {
+            print count + 0
+        }
+    ' <<< "$EFFECTIVE_CONFIG"
+}
+
+
+EFFECTIVE_PORT="$(first_value port)"
+EFFECTIVE_ROOT="$(first_value permitrootlogin)"
+EFFECTIVE_PASSWORD="$(first_value passwordauthentication)"
+EFFECTIVE_INTERACTIVE="$(first_value kbdinteractiveauthentication)"
+EFFECTIVE_PUBKEY="$(first_value pubkeyauthentication)"
+EFFECTIVE_USER="$(first_value allowusers)"
+
+
+echo "port                       : $EFFECTIVE_PORT"
+echo "permitrootlogin            : $EFFECTIVE_ROOT"
+echo "passwordauthentication     : $EFFECTIVE_PASSWORD"
+echo "kbdinteractiveauthentication: $EFFECTIVE_INTERACTIVE"
+echo "pubkeyauthentication       : $EFFECTIVE_PUBKEY"
+echo "allowusers                 : $EFFECTIVE_USER"
+
+
+# ------------------------------------------------------------
+# Проверки
+# ------------------------------------------------------------
+
+if [[ "$EFFECTIVE_PORT" != "$SSH_PORT" ]]; then
+    die "sshd использует порт $EFFECTIVE_PORT вместо $SSH_PORT."
+fi
+
+if [[ "$EFFECTIVE_ROOT" != "no" ]]; then
+    die "PermitRootLogin не отключён."
+fi
+
+if [[ "$EFFECTIVE_PASSWORD" != "no" ]]; then
+    die "PasswordAuthentication не отключён."
+fi
+
+if [[ "$EFFECTIVE_INTERACTIVE" != "no" ]]; then
+    die "KbdInteractiveAuthentication не отключён."
+fi
+
+if [[ "$EFFECTIVE_PUBKEY" != "yes" ]]; then
+    die "PubkeyAuthentication не включён."
+fi
+
+if [[ "$EFFECTIVE_USER" != "$SSH_USER" ]]; then
+    die "AllowUsers настроен неправильно."
 fi
 
 
-if [[ "$EFFECTIVE_ROOT" == "no" ]]; then
-    echo "[OK] Root login: disabled"
-else
-    echo "[ERROR] Root login НЕ отключён."
-    exit 1
-fi
+ok "Эффективные параметры SSH соответствуют настройкам."
 
 
-if [[ "$EFFECTIVE_PASSWORD" == "no" ]]; then
-    echo "[OK] Password login: disabled"
-else
-    echo "[ERROR] Password login НЕ отключён."
-    exit 1
-fi
+# ------------------------------------------------------------
+# Проверяем несколько Port
+# ------------------------------------------------------------
 
+PORT_COUNT="$(count_value port)"
 
-if [[ "$EFFECTIVE_INTERACTIVE" == "no" ]]; then
-    echo "[OK] Keyboard interactive: disabled"
-else
-    echo "[ERROR] Keyboard interactive НЕ отключён."
-    exit 1
-fi
+if (( PORT_COUNT > 1 )); then
 
+    warn "Обнаружено несколько директив Port."
 
-if [[ "$EFFECTIVE_PUBKEY" == "yes" ]]; then
-    echo "[OK] Public key authentication: enabled"
-else
-    echo "[ERROR] Public key authentication отключён."
-    exit 1
-fi
+    awk '$1=="port"{print "  "$0}' <<< "$EFFECTIVE_CONFIG"
 
+    warn "SSH может слушать несколько портов."
 
-if [[ "$EFFECTIVE_USER" == "$SSH_USER" ]]; then
-    echo "[OK] AllowUsers: $SSH_USER"
-else
-    echo "[ERROR] AllowUsers настроен неправильно."
-    exit 1
 fi
 
 
 # ============================================================
-# 14. Настраиваем systemd ssh.socket
+# 24. systemd ssh.socket
 # ============================================================
 
-echo ""
-echo "========================================="
-echo "14. Настройка systemd ssh.socket"
-echo "========================================="
+section "systemd ssh.socket"
 
-if systemctl list-unit-files | grep -q '^ssh.socket'; then
+HAS_SOCKET=0
 
-    echo "[INFO] ssh.socket найден."
+if systemctl cat ssh.socket >/dev/null 2>&1; then
 
-    sudo mkdir -p /etc/systemd/system/ssh.socket.d
+    HAS_SOCKET=1
 
-    sudo tee \
-        /etc/systemd/system/ssh.socket.d/override.conf > /dev/null <<EOF
+    info "ssh.socket найден."
+
+    sudo mkdir -p "$SOCKET_DROPIN_DIR"
+
+
+    sudo tee "$SOCKET_DROPIN" >/dev/null <<EOF
 [Socket]
 ListenStream=
-ListenStream=0.0.0.0:$SSH_PORT
-ListenStream=[::]:$SSH_PORT
+ListenStream=$SSH_PORT
 EOF
 
-    echo "[OK] Создан:"
-    echo "/etc/systemd/system/ssh.socket.d/override.conf"
+
+    ok "Создан:"
+    echo "$SOCKET_DROPIN"
 
 else
 
-    echo "[INFO] ssh.socket не используется."
+    info "ssh.socket не используется."
 
 fi
 
 
 # ============================================================
-# 15. Показываем override.conf
+# 25. systemd reload
 # ============================================================
 
-if [[ -f /etc/systemd/system/ssh.socket.d/override.conf ]]; then
-
-    echo ""
-    echo "--- ssh.socket override ---"
-
-    sudo cat /etc/systemd/system/ssh.socket.d/override.conf
-
-fi
-
-
-# ============================================================
-# 16. Перечитываем systemd
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "16. systemd daemon-reload"
-echo "========================================="
+section "systemd daemon-reload"
 
 sudo systemctl daemon-reload
 
-echo "[OK] systemd перечитал конфигурацию."
+ok "systemd перечитал конфигурацию."
 
 
-# ============================================================
-# 17. Проверяем ssh.socket ДО перезапуска
-# ============================================================
+# ------------------------------------------------------------
+# Проверяем Listen
+# ------------------------------------------------------------
 
-if systemctl list-unit-files | grep -q '^ssh.socket'; then
-
-    echo ""
-    echo "========================================="
-    echo "17. Проверка ssh.socket"
-    echo "========================================="
-
-    sudo systemctl show ssh.socket -p Listen
-
-fi
-
-
-# ============================================================
-# 18. UFW
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "18. Настройка UFW"
-echo "========================================="
-
-if sudo ufw status | grep -q "Status: active"; then
-
-    echo "[INFO] UFW активен."
-
-    # --------------------------------------------------------
-    # Разрешаем новый SSH-порт
-    # --------------------------------------------------------
-
-    if sudo ufw status | grep -qE "^${SSH_PORT}/tcp[[:space:]]+ALLOW"; then
-        echo "[OK] Порт $SSH_PORT/tcp уже разрешён в UFW."
-    else
-        sudo ufw allow "$SSH_PORT/tcp"
-        echo "[OK] Разрешён SSH-порт $SSH_PORT/tcp."
-    fi
-
-
-    # --------------------------------------------------------
-    # Удаляем старый SSH-порт 22
-    # --------------------------------------------------------
-
-    echo ""
-    echo "--- Проверка старого правила 22/tcp ---"
-
-    if sudo ufw status | grep -qE '^22/tcp[[:space:]]+ALLOW'; then
-
-        echo "[INFO] Найдено правило 22/tcp."
-
-        sudo ufw delete allow 22/tcp
-
-        echo "[OK] Правило 22/tcp удалено."
-
-    else
-
-        echo "[OK] Правило 22/tcp отсутствует."
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Проверяем, что новый порт разрешён
-    # --------------------------------------------------------
-
-    echo ""
-    echo "--- Проверка нового SSH-порта в UFW ---"
-
-    if sudo ufw status | grep -qE "^${SSH_PORT}/tcp[[:space:]]+ALLOW"; then
-
-        echo "[OK] UFW разрешает $SSH_PORT/tcp."
-
-    else
-
-        echo "[ERROR] UFW НЕ разрешает $SSH_PORT/tcp."
-        sudo ufw status numbered
-        exit 1
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Проверяем, что 22 больше не разрешён
-    # --------------------------------------------------------
-
-    echo ""
-    echo "--- Проверка удаления 22/tcp ---"
-
-    if sudo ufw status | grep -qE '^22/tcp[[:space:]]+ALLOW'; then
-
-        echo "[ERROR] Правило 22/tcp всё ещё существует!"
-        sudo ufw status numbered
-        exit 1
-
-    else
-
-        echo "[OK] Правило 22/tcp отсутствует."
-
-    fi
-
-else
-
-    echo "[INFO] UFW не активен."
-    echo "[INFO] Правила UFW изменяться не будут."
-
-fi
-
-# ============================================================
-# 19. Перезапускаем SSH
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "19. Перезапуск SSH"
-echo "========================================="
-
-if systemctl list-unit-files | grep -q '^ssh.socket'; then
-    sudo systemctl restart ssh.socket
-fi
-
-sudo systemctl restart ssh
-
-sleep 2
-
-echo "[OK] SSH перезапущен."
-
-
-# ============================================================
-# 20. Реальные listening ports
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "20. Реально слушаемые SSH-порты"
-echo "========================================="
-
-sudo ss -lntp | grep -E ':(22|'"$SSH_PORT"')\b' || true
-
-
-# ============================================================
-# 21. Проверяем порт 22
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "21. Проверка старого порта 22"
-echo "========================================="
-
-if sudo ss -lntp | grep -qE ':22\b'; then
-
-    echo "[ERROR] Порт 22 всё ещё слушается!"
-    sudo ss -lntp | grep -E ':22\b'
-
-    echo ""
-    echo "Проверяем ssh.socket:"
-    sudo systemctl show ssh.socket -p Listen
-
-    exit 1
-
-else
-
-    echo "[OK] Порт 22 НЕ слушается."
-
-fi
-
-
-# ============================================================
-# 22. Проверяем новый порт
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "22. Проверка порта $SSH_PORT"
-echo "========================================="
-
-if sudo ss -lntp | grep -qE ':'"$SSH_PORT"'\b'; then
-
-    echo "[OK] Порт $SSH_PORT реально слушается."
-
-else
-
-    echo "[ERROR] Порт $SSH_PORT НЕ слушается!"
-
-    echo ""
-    echo "--- ssh.service ---"
-    sudo systemctl status ssh --no-pager || true
-
-    echo ""
-    echo "--- ssh.socket ---"
-    sudo systemctl status ssh.socket --no-pager || true
+if (( HAS_SOCKET )); then
 
     echo ""
     echo "--- ssh.socket Listen ---"
-    sudo systemctl show ssh.socket -p Listen || true
 
-    exit 1
+    sudo systemctl show \
+        ssh.socket \
+        -p Listen
 
 fi
 
 
 # ============================================================
-# 23. Проверяем пользователя
+# 26. UFW
 # ============================================================
 
-echo ""
-echo "========================================="
-echo "23. Проверка пользователя"
-echo "========================================="
+section "UFW"
+
+if command -v ufw >/dev/null 2>&1 &&
+    sudo ufw status 2>/dev/null |
+        grep -q "Status: active"; then
+
+    UFW_ACTIVE=1
+
+    info "UFW активен."
+
+
+    # --------------------------------------------------------
+    # Проверяем старое правило 22
+    # --------------------------------------------------------
+
+    if sudo ufw status |
+        grep -qE '^22/tcp[[:space:]]+ALLOW'; then
+
+        UFW_22_EXISTED=1
+
+        info "До изменений UFW разрешал 22/tcp."
+
+    else
+
+        UFW_22_EXISTED=0
+
+        info "До изменений правило 22/tcp отсутствовало."
+
+    fi
+
+
+    # --------------------------------------------------------
+    # Новый SSH-порт
+    # --------------------------------------------------------
+
+    if sudo ufw status |
+        grep -qE "^${SSH_PORT}/tcp[[:space:]]+ALLOW"; then
+
+        ok "Порт $SSH_PORT/tcp уже разрешён."
+
+    else
+
+        sudo ufw allow "$SSH_PORT/tcp"
+
+        UFW_NEW_PORT_ADDED=1
+
+        ok "Разрешён $SSH_PORT/tcp."
+
+    fi
+
+
+    # --------------------------------------------------------
+    # Удаляем 22
+    # --------------------------------------------------------
+
+    if [[ "$UFW_22_EXISTED" -eq 1 ]]; then
+
+        sudo ufw delete allow 22/tcp
+
+        ok "Правило 22/tcp удалено."
+
+    else
+
+        ok "Правила 22/tcp нет."
+
+    fi
+
+
+    # --------------------------------------------------------
+    # Проверяем новый порт
+    # --------------------------------------------------------
+
+    if sudo ufw status |
+        grep -qE "^${SSH_PORT}/tcp[[:space:]]+ALLOW"; then
+
+        ok "UFW разрешает $SSH_PORT/tcp."
+
+    else
+
+        die "UFW не разрешает новый SSH-порт."
+
+    fi
+
+
+    # --------------------------------------------------------
+    # Проверяем 22
+    # --------------------------------------------------------
+
+    if sudo ufw status |
+        grep -qE '^22/tcp[[:space:]]+ALLOW'; then
+
+        die "UFW всё ещё разрешает 22/tcp."
+
+    else
+
+        ok "UFW больше не разрешает 22/tcp."
+
+    fi
+
+else
+
+    info "UFW не установлен или не активен."
+    info "Настройка UFW пропущена."
+
+fi
+
+
+# Сохраняем UFW state в metadata
+sudo tee -a "$NEW_BACKUP/metadata" >/dev/null <<EOF
+BACKUP_UFW_ACTIVE='$UFW_ACTIVE'
+BACKUP_UFW_22_EXISTED='$UFW_22_EXISTED'
+BACKUP_UFW_NEW_PORT_ADDED='$UFW_NEW_PORT_ADDED'
+EOF
+
+
+# ============================================================
+# 27. Перезапуск SSH
+# ============================================================
+
+section "Перезапуск SSH"
+
+if (( HAS_SOCKET )); then
+
+    # При socket activation сначала останавливаем ssh.service,
+    # затем перезапускаем socket.
+    sudo systemctl stop "$SSH_SERVICE" \
+        >/dev/null 2>&1 || true
+
+    sudo systemctl reset-failed \
+        ssh.socket \
+        "$SSH_SERVICE" \
+        >/dev/null 2>&1 || true
+
+
+    if ! sudo systemctl restart ssh.socket; then
+
+        warn "ssh.socket не запустился с указанной конфигурацией."
+
+        echo ""
+        echo "--- ssh.socket status ---"
+
+        sudo systemctl status \
+            ssh.socket \
+            --no-pager \
+            || true
+
+        echo ""
+        echo "--- journal ---"
+
+        sudo journalctl \
+            -u ssh.socket \
+            -n 20 \
+            --no-pager \
+            || true
+
+        die "Не удалось запустить ssh.socket."
+
+    fi
+
+    ok "ssh.socket перезапущен."
+
+else
+
+    if ! sudo systemctl restart "$SSH_SERVICE"; then
+
+        die "Не удалось перезапустить $SSH_SERVICE."
+
+    fi
+
+    ok "$SSH_SERVICE перезапущен."
+
+fi
+
+
+sleep 2
+
+
+# ============================================================
+# 28. Реальные listening ports
+# ============================================================
+
+section "Проверка listening ports"
+
+echo "--- SSH-порты ---"
+
+sudo ss -lntp |
+    grep -E ':(22|'"$SSH_PORT"')\b' \
+    || true
+
+
+# ============================================================
+# 29. Проверяем новый порт
+# ============================================================
+
+if ! sudo ss -lHnt |
+    awk -v port="$SSH_PORT" '
+        {
+            address=$4
+
+            if (address ~ /^\[/) {
+                gsub(/^\[/, "", address)
+                split(address, parts, "\]:")
+                current_port=parts[2]
+            } else {
+                n=split(address, parts, ":")
+                current_port=parts[n]
+            }
+
+            if (current_port == port) {
+                found=1
+            }
+        }
+
+        END {
+            exit !found
+        }
+    '; then
+
+    echo ""
+    echo "--- ssh.service ---"
+
+    sudo systemctl status \
+        "$SSH_SERVICE" \
+        --no-pager \
+        || true
+
+    echo ""
+    echo "--- ssh.socket ---"
+
+    sudo systemctl status \
+        ssh.socket \
+        --no-pager \
+        || true
+
+    echo ""
+    echo "--- ssh.socket Listen ---"
+
+    sudo systemctl show \
+        ssh.socket \
+        -p Listen \
+        || true
+
+    die "Порт $SSH_PORT не слушается."
+
+fi
+
+ok "Порт $SSH_PORT реально слушается."
+
+
+# ============================================================
+# 30. Проверяем порт 22
+# ============================================================
+
+section "Проверка старого порта 22"
+
+if sudo ss -lHnt |
+    awk '
+        {
+            address=$4
+
+            if (address ~ /^\[/) {
+                gsub(/^\[/, "", address)
+                split(address, parts, "\]:")
+                current_port=parts[2]
+            } else {
+                n=split(address, parts, ":")
+                current_port=parts[n]
+            }
+
+            if (current_port == "22") {
+                found=1
+            }
+        }
+
+        END {
+            exit !found
+        }
+    '; then
+
+    warn "Порт 22 всё ещё слушается каким-то процессом."
+
+    sudo ss -lntp |
+        awk '
+            {
+                address=$4
+
+                if (address ~ /:22$/) {
+                    print
+                }
+            }
+        '
+
+else
+
+    ok "Порт 22 не слушается."
+
+fi
+
+
+# ============================================================
+# 31. Локальная проверка SSH banner
+# ============================================================
+
+section "Проверка SSH-сервиса"
+
+BANNER="$(
+    timeout 5 \
+        bash -c \
+        "exec 3<>/dev/tcp/127.0.0.1/$SSH_PORT; head -c 40 <&3" \
+        2>/dev/null \
+        || true
+)"
+
+if [[ "$BANNER" == SSH-* ]]; then
+
+    BANNER_CLEAN="${BANNER%%$'\r'*}"
+
+    ok "SSH banner получен:"
+    echo "$BANNER_CLEAN"
+
+else
+
+    warn "SSH banner не получен."
+
+fi
+
+
+# ============================================================
+# 32. Проверка пользователя
+# ============================================================
+
+section "Проверка пользователя"
 
 id "$SSH_USER"
 
-if id -nG "$SSH_USER" | grep -qw sudo; then
-    echo "[OK] $SSH_USER имеет sudo."
-else
-    echo "[ERROR] $SSH_USER НЕ имеет sudo."
-    exit 1
-fi
+if id -nG "$SSH_USER" |
+    grep -qw sudo; then
 
-
-# ============================================================
-# 24. Проверяем SSH-файлы пользователя
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "24. SSH-файлы пользователя"
-echo "========================================="
-
-sudo ls -ld "/home/$SSH_USER/.ssh"
-sudo ls -l "/home/$SSH_USER/.ssh/authorized_keys"
-
-
-if [[ "$(sudo stat -c '%a' "/home/$SSH_USER/.ssh")" == "700" ]]; then
-    echo "[OK] .ssh = 700"
-else
-    echo "[ERROR] Неправильные права .ssh."
-    exit 1
-fi
-
-
-if [[ "$(sudo stat -c '%a' "/home/$SSH_USER/.ssh/authorized_keys")" == "600" ]]; then
-    echo "[OK] authorized_keys = 600"
-else
-    echo "[ERROR] Неправильные права authorized_keys."
-    exit 1
-fi
-
-
-# ============================================================
-# 25. Проверяем authorized_keys
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "25. Проверка authorized_keys"
-echo "========================================="
-
-if sudo test -s "/home/$SSH_USER/.ssh/authorized_keys"; then
-    echo "[OK] authorized_keys существует и не пуст."
-else
-    echo "[ERROR] authorized_keys отсутствует или пуст."
-    exit 1
-fi
-
-
-# ============================================================
-# 26. Финальный UFW
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "26. Текущий UFW"
-echo "========================================="
-
-sudo ufw status numbered
-
-# ============================================================
-# 26.5 Финальная автоматическая проверка UFW
-# ============================================================
-
-echo ""
-echo "========================================="
-echo "26.5. Финальная проверка UFW"
-echo "========================================="
-
-if sudo ufw status | grep -q "Status: active"; then
-
-    if sudo ufw status | grep -qE "^22/tcp[[:space:]]+ALLOW"; then
-        echo "[ERROR] UFW всё ещё разрешает 22/tcp!"
-        exit 1
-    else
-        echo "[OK] UFW не разрешает 22/tcp."
-    fi
-
-    if sudo ufw status | grep -qE "^${SSH_PORT}/tcp[[:space:]]+ALLOW"; then
-        echo "[OK] UFW разрешает $SSH_PORT/tcp."
-    else
-        echo "[ERROR] UFW НЕ разрешает $SSH_PORT/tcp!"
-        exit 1
-    fi
+    ok "$SSH_USER имеет sudo."
 
 else
 
-    echo "[INFO] UFW не активен — проверка правил пропущена."
+    die "$SSH_USER не имеет sudo."
 
 fi
 
 
 # ============================================================
-# 27. Финальная проверка
+# 33. Проверка SSH-файлов
+# ============================================================
+
+section "Проверка SSH-файлов"
+
+sudo ls -ld "$USER_HOME/.ssh"
+sudo ls -l "$AUTHORIZED_KEYS"
+
+
+SSH_DIR_PERMISSIONS="$(
+    sudo stat -c '%a' "$USER_HOME/.ssh"
+)"
+
+AUTHORIZED_KEYS_PERMISSIONS="$(
+    sudo stat -c '%a' "$AUTHORIZED_KEYS"
+)"
+
+
+if [[ "$SSH_DIR_PERMISSIONS" == "700" ]]; then
+
+    ok ".ssh = 700"
+
+else
+
+    die "Неправильные права .ssh: $SSH_DIR_PERMISSIONS"
+
+fi
+
+
+if [[ "$AUTHORIZED_KEYS_PERMISSIONS" == "600" ]]; then
+
+    ok "authorized_keys = 600"
+
+else
+
+    die "Неправильные права authorized_keys: $AUTHORIZED_KEYS_PERMISSIONS"
+
+fi
+
+
+# ============================================================
+# 34. Проверка authorized_keys
+# ============================================================
+
+section "Проверка authorized_keys"
+
+if sudo test -s "$AUTHORIZED_KEYS"; then
+
+    ok "authorized_keys существует и не пуст."
+
+else
+
+    die "authorized_keys отсутствует или пуст."
+
+fi
+
+
+# ============================================================
+# 35. Финальный UFW
+# ============================================================
+
+section "Финальный UFW"
+
+if (( UFW_ACTIVE )); then
+
+    sudo ufw status numbered
+
+else
+
+    info "UFW не активен."
+
+fi
+
+
+# ============================================================
+# 36. Финальная проверка
+# ============================================================
+
+section "Финальная проверка"
+
+FINAL_CONFIG="$(sudo sshd -T)"
+
+FINAL_PORT="$(
+    awk '$1=="port"{print $2; exit}' <<< "$FINAL_CONFIG"
+)"
+
+FINAL_ROOT="$(
+    awk '$1=="permitrootlogin"{print $2; exit}' <<< "$FINAL_CONFIG"
+)"
+
+FINAL_PASSWORD="$(
+    awk '$1=="passwordauthentication"{print $2; exit}' <<< "$FINAL_CONFIG"
+)"
+
+FINAL_INTERACTIVE="$(
+    awk '$1=="kbdinteractiveauthentication"{print $2; exit}' <<< "$FINAL_CONFIG"
+)"
+
+FINAL_PUBKEY="$(
+    awk '$1=="pubkeyauthentication"{print $2; exit}' <<< "$FINAL_CONFIG"
+)"
+
+FINAL_USER="$(
+    awk '$1=="allowusers"{print $2; exit}' <<< "$FINAL_CONFIG"
+)
+
+
+if [[ "$FINAL_PORT" != "$SSH_PORT" ]]; then
+    die "Финальная проверка: неправильный SSH-порт."
+fi
+
+if [[ "$FINAL_ROOT" != "no" ]]; then
+    die "Финальная проверка: root login не отключён."
+fi
+
+if [[ "$FINAL_PASSWORD" != "no" ]]; then
+    die "Финальная проверка: password authentication не отключён."
+fi
+
+if [[ "$FINAL_INTERACTIVE" != "no" ]]; then
+    die "Финальная проверка: keyboard-interactive не отключён."
+fi
+
+if [[ "$FINAL_PUBKEY" != "yes" ]]; then
+    die "Финальная проверка: public key authentication отключён."
+fi
+
+if [[ "$FINAL_USER" != "$SSH_USER" ]]; then
+    die "Финальная проверка: AllowUsers настроен неправильно."
+fi
+
+
+# ============================================================
+# 37. Успешное завершение
 # ============================================================
 
 echo ""
-echo "========================================="
-echo "       SSH SETUP COMPLETED"
-echo "========================================="
+
+# Отключаем rollback после успешного завершения.
+trap - EXIT
+
+section "SSH SETUP COMPLETED"
+
 echo ""
 echo "SSH USER       : $SSH_USER"
 echo "SSH PORT       : $SSH_PORT"
@@ -750,17 +1731,27 @@ echo "PORT 22        : disabled"
 echo "UFW            : checked"
 echo "SSH SOCKET     : checked"
 echo ""
-echo "Главный SSH-конфиг:"
-echo "/etc/ssh/sshd_config.d/01-my-settings-ssh.conf"
+echo "SSH config:"
+echo "$SSH_CONFIG"
 echo ""
 echo "SSH socket override:"
-echo "/etc/systemd/system/ssh.socket.d/override.conf"
+echo "$SOCKET_DROPIN"
+echo ""
+echo "Backup:"
+echo "$CURRENT_BACKUP"
+echo ""
+echo "Rollback:"
+echo "sudo $SCRIPT_NAME --rollback"
 echo ""
 echo "========================================="
 echo ""
-echo "!!! НЕ ЗАКРЫВАЙ ТЕКУЩУЮ SSH-СЕССИЮ !!!"
+echo "!!! НЕ ЗАКРЫВАЙТЕ ТЕКУЩУЮ SSH-СЕССИЮ !!!"
 echo ""
-echo "Сначала проверь новое подключение:"
+echo "Сначала проверьте новое подключение:"
 echo ""
 echo "ssh -p $SSH_PORT $SSH_USER@IP_СЕРВЕРА"
 echo ""
+echo "Только после успешного подключения"
+echo "можно закрыть старую SSH-сессию."
+echo ""
+echo "========================================="
